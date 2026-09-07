@@ -46,6 +46,40 @@
 
 `SetWavFiles`가 저장된 파일을 곡 목록으로 정리하고, `CreateAudioActor`가 재생 액터를 생성합니다. 재생 액터는 파일 경로를 복제하고 Multicast RPC로 재생 시작을 전달합니다.
 
+### 핵심 코드
+
+아래 코드는 실제 구현에서 로그를 생략하고 서식을 정리한 발췌입니다.
+
+**음원 준비 — 다운로드 응답의 바이트를 파일로 저장합니다.**
+
+```cpp
+// OnReqMusic의 WAV 다운로드 완료 콜백 내부
+if (bWasWavSuccessful && WavResponse.IsValid() && WavResponse->GetResponseCode() == 200)
+{
+    FString FileName = FString::Printf(
+        TEXT("%d_%d_%s.wav"), ConcertId, SongId, *Title);
+    SaveWavToFile(FileName, WavResponse->GetContent());
+}
+```
+
+[원본 코드 · OnReqMusic / SaveWavToFile](Source/VirtualIdol/Private/KMK/HttpActor_KMK.cpp#L1085)
+
+**재생 — Multicast RPC 함수에서 로컬 파일을 열어 재생합니다.** MediaPlayer 생성 이후의 처리입니다.
+
+```cpp
+// MultiRPC_PlayWavFile_Implementation 내부
+if (MediaPlayer && MediaPlayer->OpenFile(SongFilePath))
+{
+    if (MediaSoundComp)
+    {
+        MediaSoundComp->SetMediaPlayer(MediaPlayer);
+        MediaPlayer->Play();
+    }
+}
+```
+
+[원본 코드 · MultiRPC_PlayWavFile_Implementation](Source/VirtualIdol/Private/HSW_AudioLoadingActor.cpp#L69)
+
 **결과:** 프로젝트 개발 당시 멀티플레이 환경에서 여러 클라이언트의 음원 재생을 확인했습니다. 지원하는 WAV 음원을 서버에 추가하면 음원 때문에 클라이언트를 다시 빌드·배포할 필요가 없도록 구성했습니다.
 
 이 구현은 재생 시작을 전달하는 구조입니다. 모든 클라이언트의 다운로드 완료를 기다리는 준비 확인이나 재생 위치의 시각 보정은 포함하지 않습니다.
@@ -57,13 +91,51 @@
 - 피버 기여도를 Dynamic Material의 밝기 파라미터에 연결해 관객이 자신의 참여를 시각적으로 확인하도록 구현했습니다.
 - FSM 기반 관객 NPC와 C++·Blueprint 기반 상호작용을 구현했습니다.
 
-**코드 읽는 순서:** [GameMode의 공연 진행](Source/VirtualIdol/Private/HSW/HSW_AuditoriumGameMode.cpp) → [GameState의 카운트다운 전달](Source/VirtualIdol/Private/HSW/HSW_GameState_Auditorium.cpp#L88) → [캐릭터의 피버 입력·밝기 처리](Source/VirtualIdol/Private/HSW/HSW_ThirdPersonCharacter.cpp#L589).
+**공연 진행 — GameMode가 GameState의 카운트다운 RPC를 호출합니다.**
+
+```cpp
+void AHSW_AuditoriumGameMode::BroadcastCountDown()
+{
+    AHSW_GameState_Auditorium* gs = GetGameState<AHSW_GameState_Auditorium>();
+    if (gs)
+    {
+        gs->MultiRPC_ShowCountDown();
+    }
+}
+```
+
+[원본 코드 · BroadcastCountDown](Source/VirtualIdol/Private/HSW/HSW_AuditoriumGameMode.cpp#L95) · [수신 처리 · GameState](Source/VirtualIdol/Private/HSW/HSW_GameState_Auditorium.cpp#L97)
+
+**관객 반응 — 피버 입력으로 변경된 밝기 값을 머티리얼의 발광 파라미터에 반영합니다.** 로그를 생략한 실제 함수입니다.
+
+```cpp
+void AHSW_ThirdPersonCharacter::MulticastRPCBrightness_Implementation(int index)
+{
+    FeverDynamicMat->SetScalarParameterValue(
+        TEXT("jswEmissivePower-A"), FeverBright);
+}
+```
+
+[원본 코드 · 밝기 반영](Source/VirtualIdol/Private/HSW/HSW_ThirdPersonCharacter.cpp#L682) · [입력과 밝기 값 변경](Source/VirtualIdol/Private/HSW/HSW_ThirdPersonCharacter.cpp#L589)
 
 ## 3. 공연자 기능 분리
 
 기존 캐릭터 클래스에 결합된 공연자 기능을 Actor Component로 분리해, 모션 연동 플러그인의 Pawn에도 적용할 수 있도록 리팩터링했습니다. 저장소의 `UVirtual_KMK`는 `UActorComponent`를 상속하며 공연자 기능과 음원 목록·재생 요청을 포함합니다.
 
-[Virtual_KMK.h](Source/VirtualIdol/Public/KMK/Virtual_KMK.h)에서 컴포넌트의 인터페이스를, [Virtual_KMK.cpp](Source/VirtualIdol/Private/KMK/Virtual_KMK.cpp)에서 소유 액터 참조와 기능 연결을 확인할 수 있습니다. 실제 Pawn 부착 설정은 Blueprint 에셋에도 포함됩니다.
+**공연자 컴포넌트는 소유 Actor에서 필요한 메시를 찾아 연결합니다.** 아래는 `BeginPlay`의 시작 부분으로, 이후 초기화 코드는 생략했습니다.
+
+```cpp
+void UVirtual_KMK::BeginPlay()
+{
+    Super::BeginPlay();
+    meshComp = GetOwner()->FindComponentByTag<USkeletalMeshComponent>(FName(TEXT("Mesh")));
+    // 이후 초기화 코드 생략
+}
+```
+
+[원본 코드 · 소유 Actor의 메시 연결](Source/VirtualIdol/Private/KMK/Virtual_KMK.cpp#L39) · [UActorComponent 상속 선언](Source/VirtualIdol/Public/KMK/Virtual_KMK.h#L11)
+
+실제 Pawn 부착 설정은 Blueprint 에셋에도 포함됩니다.
 
 ## 담당 역할과 코드 안내
 
